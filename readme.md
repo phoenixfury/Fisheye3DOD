@@ -76,7 +76,7 @@ Our code is implemented as a **project plugin** and must be placed inside the MM
 
 2. **📊 Model Evaluation**
 
-    For immediate evaluation, download our pre-trained checkpoints from [**here**](https://pan.baidu.com/s/1IxF416KhA6VXGFV3fUYPlg?pwd=8daz) and run:
+    For immediate evaluation, download our pre-trained checkpoints from [**Hugging Face**](https://huggingface.co/weiyangdaren/Fisheye3DOD) and run:
 
     ```bash
     python tools/test.py projects/Fisheye3DOD/configs/fisheye_bevdet.py \
