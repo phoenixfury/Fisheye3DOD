@@ -1,5 +1,6 @@
 from typing import Tuple
 
+import math
 import numpy as np
 import torch
 from torch import nn
@@ -280,6 +281,8 @@ class BaseFisheyeLSSTransform(BaseViewTransform):
         downsample: int = 1,
         ocam_path: str = 'data/CarlaCollection/calib_results.txt',
         ocam_fov: float = 220,
+        kb4_calibration_path: str = None,
+        kb4_camera_frames: tuple = ('ARC_F', 'ARC_SL', 'ARC_SR', 'ARC_R'),
     ) -> None:
 
         self.azimuth_range = azimuth_range
@@ -296,10 +299,34 @@ class BaseFisheyeLSSTransform(BaseViewTransform):
             dbound=dbound,
         )
 
-        from ocamcamera import OcamCamera
-        self.omni_ocam = OcamCamera(filename=ocam_path, fov=ocam_fov)
-        self.sphere_grid_3d = self.get_sphere_grid()  # [D, H, W, 3]
-        self.register_buffer('valid_fov_mask', self.get_valid_mask())
+        # CALIPER_KB4_PATCH_V2: camera-specific intrinsics, shared neural weights.
+        self.kb4_calibration_path = kb4_calibration_path
+        self.kb4_camera_frames = tuple(kb4_camera_frames)
+        if kb4_calibration_path is None:
+            from ocamcamera import OcamCamera
+            self.omni_ocam = OcamCamera(filename=ocam_path, fov=ocam_fov)
+            self.sphere_grid_3d = self.get_sphere_grid()
+            self.register_buffer('valid_fov_mask', self.get_valid_mask())
+        else:
+            import json
+            with open(kb4_calibration_path, 'r', encoding='utf-8') as f:
+                cal = json.load(f)
+            self.kb4_cameras = []
+            for frame in self.kb4_camera_frames:
+                cam = cal['intrinsics'][frame]
+                if (cam.get('projection_for_validation') != 'opencv_fisheye'
+                        or len(cam['distortion_coefficients']) != 4):
+                    raise ValueError(f'{frame}: expected provisional OpenCV fisheye KB4 coefficients')
+                self.kb4_cameras.append(cam)
+            # Keep original parameter NAME and SHAPE for checkpoint compatibility.
+            # This legacy parameter is unused when using per-camera KB4 grids.
+            self.sphere_grid_3d = nn.Parameter(
+                torch.zeros_like(self.frustum), requires_grad=False)
+            self.register_buffer(
+                'valid_fov_mask',
+                torch.ones((len(self.kb4_cameras), 1, *self.feature_size)),
+                persistent=False)
+
         
         self.down_ratio = downsample
         self.init_layer()
@@ -411,6 +438,8 @@ class FisheyeLSSTransform(BaseFisheyeLSSTransform):
         downsample: int = 1,
         ocam_path: str = 'data/Fisheye3D/calib_results.txt',
         ocam_fov: float = 220,
+        kb4_calibration_path: str = None,
+        kb4_camera_frames: tuple = ('ARC_F', 'ARC_SL', 'ARC_SR', 'ARC_R'),
     ) -> None:
         self.azimuth_range = azimuth_range
         self.elevation_range = elevation_range
@@ -428,11 +457,51 @@ class FisheyeLSSTransform(BaseFisheyeLSSTransform):
             downsample=downsample,
             ocam_path=ocam_path,
             ocam_fov=ocam_fov,
+            kb4_calibration_path=kb4_calibration_path,
+            kb4_camera_frames=kb4_camera_frames,
         )
 
-        self.register_buffer('sphere_grid_2d', self.sphere_grid_3d[0, :, :, :2])  # [H, W, 2]
+        if kb4_calibration_path is None:
+            grid_2d = self.sphere_grid_3d[0, :, :, :2]
+        else:
+            grid_2d = self.build_kb4_sampling_grids()
+            valid = ((grid_2d[..., 0].abs() <= 1) &
+                     (grid_2d[..., 1].abs() <= 1))
+            self.valid_fov_mask = valid.unsqueeze(1).float()
+        # Derived calibration grids are deterministic; omit them from checkpoints.
+        self.register_buffer('sphere_grid_2d', grid_2d, persistent=False)
         self.init_layer()
     
+    def build_kb4_sampling_grids(self):
+        """Projection from frustum optical rays to input image normalized coords.
+
+        Assumes native OpenCV fisheye KB4, x-right/y-down/z-forward optical
+        coordinates, and full-frame resize without crop/pad/flip.
+        Returns [N, H, W, 2] in camera_names order.
+        """
+        xyz = self.frustum.detach()[0].cpu().numpy().astype(np.float64)
+        x, y, z = xyz[..., 0], xyz[..., 1], xyz[..., 2]
+        rho = np.hypot(x, y)
+        theta = np.arctan2(rho, z)
+        grids = []
+        input_h, input_w = self.image_size
+        for camera in self.kb4_cameras:
+            k1, k2, k3, k4 = camera['distortion_coefficients']
+            t2 = theta * theta
+            r = theta * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+            scale = np.divide(r, rho, out=np.ones_like(r), where=rho > 1e-12)
+            K = np.asarray(camera['camera_matrix'], dtype=np.float64)
+            u = K[0, 0] * x * scale + K[0, 2]
+            v = K[1, 1] * y * scale + K[1, 2]
+            src_w, src_h = int(camera['width']), int(camera['height'])
+            # Original pixel centers -> pixel centers after direct resize.
+            u = (u + .5) * input_w / src_w - .5
+            v = (v + .5) * input_h / src_h - .5
+            gx = 2.0 * u / max(input_w - 1, 1) - 1.0
+            gy = 2.0 * v / max(input_h - 1, 1) - 1.0
+            grids.append(np.stack((gx, gy), axis=-1))
+        return torch.as_tensor(np.stack(grids), dtype=torch.float32)
+
     def init_layer(self):
         self.depthnet = nn.Conv2d(self.in_channels, self.D + self.C, 1)
         if self.down_ratio > 1:
@@ -463,15 +532,27 @@ class FisheyeLSSTransform(BaseFisheyeLSSTransform):
     def get_cam_feats(self, x):
         B, N, C, fH, fW = x.shape
         x = x.view(B * N, C, fH, fW)
+        if self.kb4_calibration_path is None:
+            grid = self.sphere_grid_2d.unsqueeze(0).expand(B * N, -1, -1, -1)
+        else:
+            if N != len(self.kb4_cameras):
+                raise ValueError(f'Expected {len(self.kb4_cameras)} cameras, received {N}')
+            grid = self.sphere_grid_2d.unsqueeze(0).expand(B, -1, -1, -1, -1)
+            grid = grid.reshape(B * N, *self.sphere_grid_2d.shape[1:])
         warp_x = F.grid_sample(
-            x, self.sphere_grid_2d.unsqueeze(0).expand(B * N, -1, -1, -1), align_corners=True)  # BN x C x H x W
+            x, grid.to(device=x.device, dtype=x.dtype), align_corners=True)  # BN x C x H x W
         x = self.depthnet(warp_x)
 
         depth = x[:, :self.D].softmax(dim=1)
 
         x = depth.unsqueeze(1) * x[:, self.D:(self.D + self.C)].unsqueeze(2)
 
-        fH, fW = self.sphere_grid_2d.shape[:2]
+        if self.kb4_calibration_path is not None:
+            mask = self.valid_fov_mask.unsqueeze(0).expand(
+                B, -1, -1, -1, -1).reshape(B * N, 1, 1, *self.feature_size)
+            x = x * mask.to(device=x.device, dtype=x.dtype)
+
+        fH, fW = self.feature_size
         x = x.view(B, N, self.C, self.D, fH, fW)
         x = x.permute(0, 1, 3, 4, 5, 2)
         return x

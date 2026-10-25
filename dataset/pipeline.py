@@ -16,6 +16,35 @@ from ocamcamera import OcamCamera
 
 
 @TRANSFORMS.register_module()
+class FisheyePhotoMetricDistortion(BaseTransform):
+    """Apply one shared photometric transform to all nested camera views."""
+
+    def __init__(self, img_key='cam_fisheye', brightness_delta=24,
+                 contrast_range=(0.8, 1.2), saturation_range=(0.8, 1.2),
+                 hue_delta=12):
+        self.img_key = img_key
+        self.transformer = TRANSFORMS.build(dict(
+            type='PhotoMetricDistortion3D',
+            brightness_delta=brightness_delta,
+            contrast_range=contrast_range,
+            saturation_range=saturation_range,
+            hue_delta=hue_delta))
+
+    def transform(self, data):
+        transformed = []
+        shared = None
+        for image in data[self.img_key]['img']:
+            sample = {'img': image}
+            if shared is not None:
+                sample['photometric_param'] = shared
+            sample = self.transformer(sample)
+            shared = sample['photometric_param']
+            transformed.append(sample['img'])
+        data[self.img_key]['img'] = transformed
+        return data
+
+
+@TRANSFORMS.register_module()
 class ImageAug3D(BaseTransform):
 
     def __init__(self, final_dim, resize_lim, bot_pct_lim, rot_lim, rand_flip,

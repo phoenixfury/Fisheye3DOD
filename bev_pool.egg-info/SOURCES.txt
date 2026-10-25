@@ -1,0 +1,13 @@
+setup.py
+bev_pool.egg-info/PKG-INFO
+bev_pool.egg-info/SOURCES.txt
+bev_pool.egg-info/dependency_links.txt
+bev_pool.egg-info/not-zip-safe
+bev_pool.egg-info/top_level.txt
+models/bevdet/ops/bev_pool/src/bev_pool.cpp
+models/bevdet/ops/bev_pool/src/bev_pool_cuda.cu
+models/bevdet/ops/voxel/src/scatter_points_cpu.cpp
+models/bevdet/ops/voxel/src/scatter_points_cuda.cu
+models/bevdet/ops/voxel/src/voxelization.cpp
+models/bevdet/ops/voxel/src/voxelization_cpu.cpp
+models/bevdet/ops/voxel/src/voxelization_cuda.cu

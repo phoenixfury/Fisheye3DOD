@@ -48,8 +48,9 @@ class SaveDetectionHook(Hook):
             self.detection_outputs.append(save_result)
     
     def dump_results(self, runner: Runner):
-        epoch = runner.epoch
+        epoch = runner._train_loop.epoch if runner._train_loop is not None and not isinstance(runner._train_loop, dict) else 0
         save_path = Path(runner.log_dir) / 'save_detection' / f'epoch_{epoch}.pkl'
+        save_path.parent.mkdir(parents=True, exist_ok=True)
         dump_data = {
             'epoch': epoch,
             'data_list': self.detection_outputs

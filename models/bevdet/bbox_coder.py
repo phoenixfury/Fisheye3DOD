@@ -272,7 +272,10 @@ class LSSHungarianAssigner3D(BaseAssigner):
                 # No ground truth, assign all to background
                 assigned_gt_inds[:] = 0
             return AssignResult(
-                num_gts, assigned_gt_inds, None, labels=assigned_labels)
+                num_gts,
+                assigned_gt_inds,
+                bboxes.new_zeros(num_bboxes),
+                labels=assigned_labels)
 
         # 2. compute the weighted costs
         # Hard code here to be compatible with the interface of
