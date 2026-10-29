@@ -9,6 +9,7 @@
 # ------------------------------------------------------------------------
 import warnings
 from collections import OrderedDict
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn as nn
@@ -18,6 +19,30 @@ from mmengine.model import BaseModule
 from torch.nn.modules.batchnorm import _BatchNorm
 
 from mmdet3d.registry import MODELS
+
+
+@contextmanager
+def _private_batchnorm_recompute_buffers(module):
+    """Recompute batch-normalized activations without updating running stats twice.
+
+    Keep training-mode batch statistics and the identical autograd graph, but
+    send recomputation's running-stat updates to temporary buffers. Swapping
+    buffers instead of copying them back avoids autograd version-counter errors.
+    Original buffers (including num_batches_tracked) are always restored.
+    """
+    originals = []
+    try:
+        for child in module.modules():
+            if isinstance(child, _BatchNorm) and child.training and child.track_running_stats:
+                for name in ('running_mean', 'running_var', 'num_batches_tracked'):
+                    value = getattr(child, name)
+                    if value is not None:
+                        originals.append((child, name, value))
+                        setattr(child, name, value.clone())
+        yield
+    finally:
+        for child, name, value in originals:
+            setattr(child, name, value)
 
 VoVNet19_slim_dw_eSE = {
     'stem': [64, 64, 64],
@@ -285,7 +310,10 @@ class _OSA_module(nn.Module):
     def forward(self, x):
 
         if self.use_checkpoint and self.training:
-            xt = cp.checkpoint(self._forward, x)
+            xt = cp.checkpoint(
+                self._forward, x, use_reentrant=False,
+                context_fn=lambda: (nullcontext(), _private_batchnorm_recompute_buffers(self)),
+            )
         else:
             xt = self._forward(x)
 
